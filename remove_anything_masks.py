@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from lama_inpaint import inpaint_img_with_lama
 
-# matplotlib.use('TkAgg')
+matplotlib.use('TkAgg')
 from matplotlib import pyplot as plt
 from utils import dilate_mask, load_img_to_array, save_array_to_img
 
@@ -32,6 +32,35 @@ def get_bbox_from_mask(mask):
 
     return np.array([[x_min, y_min], [x_max, y_max]])
 
+
+def refine_masks(masks):
+    # Iteratively merge masks with overlapping bboxes
+
+    bboxes = {idx: get_bbox_from_mask(mask) for idx, mask in masks.items()}
+    merged_masks = {}
+    merged_bboxes = {}
+    for i, (idx, bbox) in enumerate(bboxes.items()):
+        if i == 0:
+            merged_masks[i] = masks[idx]
+            merged_bboxes[i] = bbox
+        else:
+            merged = False
+            for j in range(i):
+                if np.any(np.logical_and(bbox[0] >= merged_bboxes[j][0], bbox[1] <= merged_bboxes[j][1])):
+                    merged_masks[j] += masks[idx]
+                    merged_bboxes[j] = np.array([
+                        np.minimum(merged_bboxes[j][0], bbox[0]),
+                        np.maximum(merged_bboxes[j][1], bbox[1])
+                    ])
+                    merged = True
+                    break
+            if not merged:
+                merged_masks[i] = masks[idx]
+                merged_bboxes[i] = bbox
+    for i, mask in merged_masks.items():
+        visualize_mask(mask)
+
+
 def setup_args(parser):
     parser.add_argument(
         "--input_img", type=str, required=True,
@@ -42,7 +71,7 @@ def setup_args(parser):
         help="Path to the segmentation mask",
     )
     parser.add_argument(
-        "--depth_path", type=str,
+        "--depth_path", type=str, required=True,
         help="Path to the depth map",
     )
     parser.add_argument(
@@ -110,12 +139,11 @@ if __name__ == "__main__":
     mask = load_img_to_array(args.seg_path)
     masks = {}
     for insatnce in np.unique(mask):
-        if insatnce > 1:
+        if insatnce != 1:
             masks[insatnce] = ((mask == insatnce).astype(np.uint8) * 255)
+
     # dilate mask to avoid unmasked edge effect
     if args.dilate_kernel_size is not None:
-        """depth = load_img_to_array(args.depth_path)
-        sorted_masks = sorted(masks.items(), key=lambda x: np.max(depth[x[1] == 255]), reverse=True)"""
         masks = {idx: dilate_mask(mask, args.dilate_kernel_size) for idx, mask in masks.items()}
     os.makedirs(args.output_dir, exist_ok=True)
     if args.method == "separate":
@@ -129,12 +157,6 @@ if __name__ == "__main__":
         merged_mask = np.zeros_like(mask)
         for idx, mask in masks.items():
             merged_mask += mask
-        # Save a version with merged mask removed
-        masked_img = img.copy()
-        masked_img[merged_mask != 0] = 0
-        import cv2
-        cv2.imwrite(f"{args.output_dir}/inpainted_merged_masked.png", masked_img)
-        cv2.imwrite(f"{args.output_dir}/merged_mask.png", merged_mask)
         img_inpainted_p = f"{args.output_dir}/inpainted_merged.png"
         img_inpainted = inpaint_img_with_lama(
             img, merged_mask, args.lama_config, args.lama_ckpt, device=device)
@@ -144,6 +166,7 @@ if __name__ == "__main__":
         # Inpaint iteratively starting from the smallest mask
         # Keep track of bboxes of all inpainted masks
         # If the current mask overlaps with any of the previous masks, merge them and inpaint
+        refine_masks(masks)
         sorted_masks = sorted(masks.items(), key=lambda x: np.sum(x[1]))
         img_inpainted = img
         for idx, mask in sorted_masks:

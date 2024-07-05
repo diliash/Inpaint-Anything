@@ -12,8 +12,6 @@ from sklearn.metrics import mean_squared_error
 
 EPSILON = 1e-8
 
-print("Evaluated against inpainted GT")
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -31,65 +29,14 @@ if __name__ == "__main__":
         with open(args.selected_scenes, "r") as f:
             selected_scenes = f.read().splitlines()
 
-    lpips_metric = lpips.LPIPS(net='alex')
-
     subexp_dirs = [path for path in glob(f"{args.exp_dir}/*") if os.path.isdir(path)]
-    rows = []
-    rows.append(["subexp_dir", "image_name", "psnr", "ssim", "lpips"])
-    for subexp_dir in subexp_dirs:
-        print(subexp_dir)
-        inpainted_images = glob(f"{subexp_dir}/*/inpainted_merged.png")
-        for inpainted_image in inpainted_images:
-            scene_id = os.path.dirname(inpainted_image).split("/")[-1]
-            if args.selected_scenes and scene_id not in selected_scenes:
-                continue
-            gt_image = cv2.imread(f"{args.gt_path}/{scene_id}/room.png")
-            inpainted_image = cv2.imread(inpainted_image)
-            gt_image = cv2.resize(gt_image, (inpainted_image.shape[1], inpainted_image.shape[0]))
-            gt_image = cv2.cvtColor(gt_image, cv2.COLOR_BGR2RGB)
-            inpainted_image = cv2.cvtColor(inpainted_image, cv2.COLOR_BGR2RGB)
-
-            psnr = cv2.PSNR(gt_image, inpainted_image)
-            ssim_score = ssim(gt_image, inpainted_image, multichannel=True, win_size=3)
-
-            lpips_score = lpips_metric(torch.tensor(gt_image).permute(2, 0, 1).unsqueeze(0).float() / 255,
-                           torch.tensor(inpainted_image).permute(2, 0, 1).unsqueeze(0).float() / 255)
-            lpips_score = lpips_score.item()
-
-            rows.append([subexp_dir, scene_id, psnr, ssim_score, lpips_score])
-    with open(f"{args.exp_dir}/results.csv", "w") as f:
-        writer = csv.writer(f)
-        writer.writerows(rows)
-
-    # Calculate and write averages per subexp_dir
-    rows = []
-    header = ["subexp_dir", "psnr", "ssim", "lpips"]
-    with open(f"{args.exp_dir}/results.csv", "r") as f:
-        reader = csv.reader(f)
-        next(reader)
-        data = []
-        for recorded_row in reader:
-            row = [recorded_row[0], recorded_row[2], recorded_row[3], recorded_row[4]]
-            data.append(row)
-        data = np.array(data)
-        subexp_dirs = np.unique(data[:, 0])
-        for subexp_dir in subexp_dirs:
-            subexp_rows = data[data[:, 0] == subexp_dir]
-            subexp_rows = subexp_rows[:, 1:].astype(float)  # Exclude the subexp_dir column
-            avg_row = np.mean(subexp_rows, axis=0)
-            rows.append([subexp_dir, *avg_row])
-    # Prepend header
-    rows = [header] + rows
-    with open(f"{args.exp_dir}/results_avg.csv", "w") as f:
-        writer = csv.writer(f)
-        writer.writerows(rows)
 
     # Now do same with applicable metrics for depth (also normalize the depths first)
     rows = []
     rows.append(["subexp_dir", "image_name", "rmse", "absrel"])
     for subexp_dir in subexp_dirs:
         print(subexp_dir)
-        inpainted_depths = glob(f"{subexp_dir}/*/inpainted-scene-depth.npy")
+        inpainted_depths = glob(f"{subexp_dir}/*/inpainted-scene-gt-depth.npy")
         for inpainted_depth in inpainted_depths:
             scene_id = os.path.dirname(inpainted_depth).split("/")[-1]
             if args.selected_scenes and scene_id not in selected_scenes:
@@ -114,20 +61,20 @@ if __name__ == "__main__":
 
             depth_color = np.zeros(inpainted_depth.shape + (3,))
             depth_color[valid_mask] = np.squeeze(cv2.applyColorMap((inpainted_depth_valid * 255).astype(np.uint8), cv2.COLORMAP_INFERNO))
-            cv2.imwrite(f"{subexp_dir}/{scene_id}/inpainted-scene-depth-valid-color.png", depth_color)
+            cv2.imwrite(f"{subexp_dir}/{scene_id}/inpainted-scene-depth-gt-valid-color.png", depth_color)
 
             rmse = np.sqrt(mean_squared_error(gt_depth_valid, inpainted_depth_valid))
             abs_diff = np.abs(inpainted_depth_valid - gt_depth_valid)
             absrel = np.mean(abs_diff / gt_depth_valid)
             rows.append([subexp_dir, scene_id, rmse, absrel])
-    with open(f"{args.exp_dir}/results_depth.csv", "w") as f:
+    with open(f"{args.exp_dir}/results_depth_gt.csv", "w") as f:
         writer = csv.writer(f)
         writer.writerows(rows)
 
     # Calculate and write averages per subexp_dir
     rows = []
     header = ["subexp_dir", "rmse", "absrel"]
-    with open(f"{args.exp_dir}/results_depth.csv", "r") as f:
+    with open(f"{args.exp_dir}/results_depth_gt.csv", "r") as f:
         reader = csv.reader(f)
         next(reader)
         data = []
@@ -142,7 +89,7 @@ if __name__ == "__main__":
             avg_row = np.mean(subexp_rows, axis=0)
             rows.append([subexp_dir, *avg_row])
     rows = [header] + rows
-    with open(f"{args.exp_dir}/results_depth_avg.csv", "w") as f:
+    with open(f"{args.exp_dir}/results_depth_gt_avg.csv", "w") as f:
         writer = csv.writer(f)
         writer.writerows(rows)
 
@@ -153,7 +100,7 @@ if args.v2:
     rows.append(["subexp_dir", "image_name", "rmse", "absrel"])
     for subexp_dir in subexp_dirs:
         print(subexp_dir)
-        inpainted_depths = glob(f"{subexp_dir}/*/inpainted-scene-depth-v2.npy")
+        inpainted_depths = glob(f"{subexp_dir}/*/inpainted-scene-gt-depth-v2.npy")
         for inpainted_depth in inpainted_depths:
             scene_id = os.path.dirname(inpainted_depth).split("/")[-1]
             if args.selected_scenes and scene_id not in selected_scenes:
@@ -178,20 +125,20 @@ if args.v2:
 
             depth_color = np.zeros(inpainted_depth.shape + (3,))
             depth_color[valid_mask] = np.squeeze(cv2.applyColorMap((inpainted_depth_valid * 255).astype(np.uint8), cv2.COLORMAP_INFERNO))
-            cv2.imwrite(f"{subexp_dir}/{scene_id}/inpainted-scene-depth-valid-color-v2.png", depth_color)
+            cv2.imwrite(f"{subexp_dir}/{scene_id}/inpainted-scene-depth-gt-valid-color-v2.png", depth_color)
 
             rmse = np.sqrt(mean_squared_error(gt_depth_valid, inpainted_depth_valid))
             abs_diff = np.abs(inpainted_depth_valid - gt_depth_valid)
             absrel = np.mean(abs_diff / gt_depth_valid)
             rows.append([subexp_dir, scene_id, rmse, absrel])
-    with open(f"{args.exp_dir}/results_depth-v2.csv", "w") as f:
+    with open(f"{args.exp_dir}/results_depth_gt-v2.csv", "w") as f:
         writer = csv.writer(f)
         writer.writerows(rows)
 
     # Calculate and write averages per subexp_dir
     rows = []
     header = ["subexp_dir", "rmse", "absrel"]
-    with open(f"{args.exp_dir}/results_depth-v2.csv", "r") as f:
+    with open(f"{args.exp_dir}/results_depth_gt-v2.csv", "r") as f:
         reader = csv.reader(f)
         next(reader)
         data = []
@@ -206,6 +153,6 @@ if args.v2:
             avg_row = np.mean(subexp_rows, axis=0)
             rows.append([subexp_dir, *avg_row])
     rows = [header] + rows
-    with open(f"{args.exp_dir}/results_depth_avg-v2.csv", "w") as f:
+    with open(f"{args.exp_dir}/results_depth_gt_avg-v2.csv", "w") as f:
         writer = csv.writer(f)
         writer.writerows(rows)

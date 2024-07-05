@@ -3,7 +3,7 @@ from glob import glob
 
 from tqdm import tqdm
 
-data_path = "/project/3dlg-hcvc/diorama/wss/scenes/"
+data_path = "/project/3dlg-hcvc/diorama/wss/scenes"
 
 scenes = glob(f"{data_path}/*")
 print(scenes)
@@ -15,8 +15,8 @@ for scene in tqdm(scenes):
     os.system(f"python remove_anything_masks_naive.py\
               --input_img {scene}/scene.png\
                 --seg_path {scene}/seg.png\
-                --dilate_kernel_size 0\
-                --output_dir ./results/gt-rerun/merged/{scene_name}\
+                --dilate_kernel_size 10\
+                --output_dir ./results/gt-rerun-vis-pcd/merged/{scene_name}\
                 --sam_model_type 'vit_h'\
                 --sam_ckpt sam_vit_h_4b8939.pth\
                 --lama_config lama/configs/prediction/default.yaml\
