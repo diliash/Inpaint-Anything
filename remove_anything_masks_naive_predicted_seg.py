@@ -1,8 +1,10 @@
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
 
+import cv2
 import matplotlib
 import numpy as np
 import torch
@@ -40,6 +42,10 @@ def setup_args(parser):
     parser.add_argument(
         "--seg_path", type=str, required=True,
         help="Path to the segmentation mask",
+    )
+    parser.add_argument(
+        "--seg_anno", type=str,
+        help="Path to the segmentation annotation",
     )
     parser.add_argument(
         "--depth_path", type=str,
@@ -84,34 +90,22 @@ def setup_args(parser):
 
 
 if __name__ == "__main__":
-    """Example usage:
-    python remove_anything_gt.py \
-        --input_img /project/3dlg-hcvc/diorama/wss/scenes/scene00000/scene.png \
-        --seg_path /project/3dlg-hcvc/diorama/wss/scenes/scene00000/seg.png \
-        --dilate_kernel_size 0 \
-        --output_dir ./results/gt/separate/scene00000 \
-        --sam_model_type "vit_h" \
-        --sam_ckpt sam_vit_h_4b8939.pth \
-        --lama_config lama/configs/prediction/default.yaml \
-        --lama_ckpt ./pretrained_models/big-lama
-        --method iterative-depth
-        --depth_path /project/3dlg-hcvc/diorama/wss/scenes/scene00000/depth.png
-    """
     parser = argparse.ArgumentParser()
     setup_args(parser)
     args = parser.parse_args(sys.argv[1:])
+
+    print(args.seg_path)
 
     if args.method == "iterative-depth" and args.depth_path is None:
         raise ValueError("Depth path is required for iterative-depth method")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     img = load_img_to_array(args.input_img)
+    # Also read RGBA
+    img_a = cv2.imread(args.input_img, cv2.IMREAD_UNCHANGED)
 
     mask = load_img_to_array(args.seg_path)
-    masks = {}
-    for insatnce in np.unique(mask):
-        if insatnce > 1:
-            masks[insatnce] = ((mask == insatnce).astype(np.uint8) * 255)
+    masks = {0: mask}
     # dilate mask to avoid unmasked edge effect
     if args.dilate_kernel_size is not None:
         """depth = load_img_to_array(args.depth_path)
@@ -125,20 +119,28 @@ if __name__ == "__main__":
                 img, mask, args.lama_config, args.lama_ckpt, device=device)
             save_array_to_img(img_inpainted, img_inpainted_p)
     elif args.method == "merged":
-        # merge all masks
-        merged_mask = np.zeros_like(mask)
+        merged_mask = np.zeros_like(mask, dtype=np.uint8)
         for idx, mask in masks.items():
             merged_mask += mask
-        # Save a version with merged mask removed
-        masked_img = img.copy()
-        masked_img[merged_mask != 0] = 0
-        import cv2
+
+        img_with_alpha = cv2.imread(args.input_img, cv2.IMREAD_UNCHANGED)
+        if img_with_alpha.shape[2] == 3:
+            img_with_alpha = cv2.cvtColor(img_with_alpha, cv2.COLOR_BGR2BGRA)
+
+        masked_img = img_with_alpha.copy()
+        masked_img[merged_mask != 0] = [0, 0, 0, 255]
+
         cv2.imwrite(f"{args.output_dir}/inpainted_merged_masked.png", masked_img)
         cv2.imwrite(f"{args.output_dir}/merged_mask.png", merged_mask)
+
         img_inpainted_p = f"{args.output_dir}/inpainted_merged.png"
         img_inpainted = inpaint_img_with_lama(
-            img, merged_mask, args.lama_config, args.lama_ckpt, device=device)
-        save_array_to_img(img_inpainted, img_inpainted_p)
+            img_with_alpha[:,:,:3], merged_mask, args.lama_config, args.lama_ckpt, device=device)
+
+        img_inpainted_bgra = cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2BGRA)
+        img_inpainted_bgra[:,:,3] = img_with_alpha[:,:,3]
+
+        cv2.imwrite(img_inpainted_p, img_inpainted_bgra)
     elif args.method == "iterative-s-l":
         # Sort masks from smallest to largest area
         # Inpaint iteratively starting from the smallest mask
