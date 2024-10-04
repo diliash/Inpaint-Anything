@@ -1,9 +1,36 @@
+import argparse
+import json
 import os
 from glob import glob
 
 import cv2
 import numpy as np
 import open3d as o3d
+from scipy.spatial import cKDTree
+from sklearn.cluster import DBSCAN, KMeans
+
+DEBUG = False
+INTRINSICS = {
+    "nyu": (518.8579, 519.4696, 325.58246, 253.73616, 480, 640),  # (fx, fy, cx, cy, height, width)
+    "multiview": (224/(2*np.tan((np.pi/3)/2)), 224/(2*np.tan((np.pi/3)/2)), 112, 112, 224, 224),
+    "wss": (784/(2*np.tan((np.pi/3)/2)), 784/(2*np.tan((np.pi/3)/2)), 504, 392, 784, 1008)
+}
+
+
+def preprocess_pcd(scene_pcd):
+    prev_points_n = len(scene_pcd.points)
+    if DEBUG:
+        o3d.visualization.draw_geometries([scene_pcd])
+    scene_pcd = scene_pcd.voxel_down_sample(voxel_size=0.05)
+    print(f"Removed {prev_points_n - len(scene_pcd.points)} points.")
+    prev_points_n = len(scene_pcd.points)
+    if DEBUG:
+        o3d.visualization.draw_geometries([scene_pcd])
+    scene_pcd, _ = scene_pcd.remove_statistical_outlier(nb_neighbors=200, std_ratio=2.0)
+    print(f"Removed {prev_points_n - len(scene_pcd.points)} points.")
+    if DEBUG:
+        o3d.visualization.draw_geometries([scene_pcd])
+    return scene_pcd
 
 
 def save_visualization(geometries, filename, width=512, height=512):
@@ -11,69 +38,302 @@ def save_visualization(geometries, filename, width=512, height=512):
     vis.create_window(width=width, height=height, visible=False)
     for geometry in geometries:
         vis.add_geometry(geometry)
-    
-    vis.get_render_option().background_color = [1.0, 1.0, 1.0]  # White background
+
+    vis.get_render_option().background_color = [1.0, 1.0, 1.0]
     vis.update_renderer()
     vis.poll_events()
     vis.update_geometry(geometries[0])
-    
+
     image = vis.capture_screen_float_buffer(do_render=True)
     cv2.imwrite(filename, np.array(image)[:, :, ::-1] * 255)
     vis.destroy_window()
 
-def segment_multiple_planes(pcd, distance_threshold=0.05, ransac_n=4, num_iterations=1000, min_points=100, max_planes=4):
+
+def cluster_normals(pcd, angle_threshold=10, min_points=200, eps=0.1, min_samples=5, n_seeds=10):
+    normals = np.asarray(pcd.normals)
+    points = np.asarray(pcd.points)
+    clusters = []
+    clusters_avg_normals = []
+    remaining_indices = set(range(len(normals)))
+    noise_indices = set()
+
+    vis_pcd = o3d.geometry.PointCloud(pcd)
+
+    kmeans = KMeans(n_clusters=n_seeds, random_state=42)
+    kmeans.fit(normals)
+    seed_normals = kmeans.cluster_centers_
+
+    if DEBUG:
+        labels = kmeans.labels_
+        vis_colors = np.array([np.random.rand(3) for _ in range(len(np.unique(labels)))])
+        pcd_colors = np.zeros((len(normals), 3))
+        for i, label in enumerate(labels):
+            pcd_colors[i] = vis_colors[label]
+        vis_pcd.colors = o3d.utility.Vector3dVector(pcd_colors)
+        o3d.visualization.draw_geometries([vis_pcd], window_name="Normal Clustering")
+
+    for seed_normal in seed_normals:
+        if len(remaining_indices) < min_points:
+            break
+
+        cluster = []
+        for i in remaining_indices:
+            angle = np.arccos(np.clip(np.dot(seed_normal, normals[i]), -1.0, 1.0)) * 180 / np.pi
+            if np.abs(angle) <= angle_threshold:
+                cluster.append(i)
+        if len(cluster) >= min_points:
+            cluster_points = points[cluster]
+
+            cluster_dbscan = DBSCAN(eps=eps, min_samples=min_samples)
+            cluster_labels = cluster_dbscan.fit_predict(cluster_points)
+
+            unique_labels = set(cluster_labels)
+            if -1 in unique_labels:
+                unique_labels.remove(-1)
+
+            if len(unique_labels) == 0:
+                print("DBSCAN failed to find subclusters. Treating as a single cluster.")
+                subclusters = [cluster]
+            else:
+                subclusters = [np.array(cluster)[cluster_labels == label].tolist() for label in unique_labels]
+
+            for subcluster in subclusters:
+                if len(subcluster) >= min_points:
+                    clusters.append(subcluster)
+                    remaining_indices -= set(subcluster)
+
+                    # Visualize the current subcluster
+                    vis_colors = np.asarray(vis_pcd.colors)
+                    subcluster_color = np.random.rand(3)
+                    vis_colors[subcluster] = subcluster_color
+
+                    subcluster_pcd = vis_pcd.select_by_index(subcluster)
+                    subcluster_pcd.paint_uniform_color(subcluster_color)
+
+                    clusters_avg_normals.append(np.mean(normals[subcluster], axis=0))
+
+                    other_pcd = vis_pcd.select_by_index(list(remaining_indices))
+                    other_pcd.paint_uniform_color([0.8, 0.8, 0.8])  # Light gray
+
+                    if DEBUG:
+                        o3d.visualization.draw_geometries([subcluster_pcd, other_pcd],
+                                                           window_name="Subcluster Visualization",
+                                                           width=800, height=600)
+                        print(f"Visualizing subcluster with {len(subcluster)} points")
+                else:
+                    noise_indices.update(subcluster)
+
+            print(f"Remaining indices for next iter: {len(remaining_indices)}")
+        else:
+            if len(cluster) > 0:
+                print(f"Cluster with {len(cluster)} points is too small. Adding to noise.")
+                noise_indices.update(cluster)
+                remaining_indices -= set(cluster)
+
+    if remaining_indices:
+        noise_indices.update(remaining_indices)
+
+    if noise_indices and clusters:
+        print(f"Assigning {len(noise_indices)} noise points to closest clusters")
+        cluster_centers = [np.mean(points[c], axis=0) for c in clusters]
+        tree = cKDTree(cluster_centers)
+
+        for idx in noise_indices:
+            _, closest_cluster_idx = tree.query(points[idx])
+            clusters[closest_cluster_idx].append(idx)
+
+        vis_colors = np.asarray(vis_pcd.colors)
+        for i, cluster in enumerate(clusters):
+            cluster_color = np.random.rand(3)
+            vis_colors[cluster] = cluster_color
+
+        if DEBUG:
+            print("Visualizing final result with noise points assigned")
+            o3d.visualization.draw_geometries([vis_pcd],
+                                               window_name="Final Result",
+                                               width=800, height=600)
+    elif not clusters:
+        # If no clusters were found, treat all points as a single cluster
+        clusters = [list(range(len(normals)))]
+        clusters_avg_normals = [np.mean(normals, axis=0)]
+    return clusters, np.asarray(clusters_avg_normals)
+
+
+def create_plane_mesh(plane_model, points, color):
+    a, b, c, d = plane_model
+    normal = np.array([a, b, c])
+    normal = normal / np.linalg.norm(normal)
+
+    u = np.array([1, 0, 0])
+    if np.abs(np.dot(u, normal)) > 0.999:
+        u = np.array([0, 1, 0])
+    v = np.cross(normal, u)
+    u = np.cross(v, normal)
+    u = u / np.linalg.norm(u)
+    v = v / np.linalg.norm(v)
+
+    projected_points = points - np.outer(np.dot(points, normal) + d, normal)
+
+    u_coords = np.dot(projected_points, u)
+    v_coords = np.dot(projected_points, v)
+
+    min_u, max_u = np.min(u_coords), np.max(u_coords)
+    min_v, max_v = np.min(v_coords), np.max(v_coords)
+
+    extents = np.array([max_u - min_u, max_v - min_v])
+
+    plane_mesh = o3d.geometry.TriangleMesh.create_box(width=extents[0], height=extents[1], depth=0.01)
+    plane_mesh.compute_vertex_normals()
+    plane_mesh.paint_uniform_color(color)
+
+    center_3d = np.mean(points, axis=0)
+
+    rotation = np.column_stack((u, v, normal))
+    transform = np.eye(4)
+    transform[:3, :3] = rotation
+    transform[:3, 3] = center_3d - rotation @ (extents[0]/2, extents[1]/2, 0.005)
+
+    plane_mesh.transform(transform)
+
+    debug_geometries = []
+
+    original_points_pcd = o3d.geometry.PointCloud()
+    original_points_pcd.points = o3d.utility.Vector3dVector(points)
+    original_points_pcd.paint_uniform_color([1, 0, 0])
+
+    projected_points_pcd = o3d.geometry.PointCloud()
+    projected_points_pcd.points = o3d.utility.Vector3dVector(projected_points)
+    projected_points_pcd.paint_uniform_color([0, 1, 0])
+
+    center_pcd = o3d.geometry.PointCloud()
+    center_pcd.points = o3d.utility.Vector3dVector([center_3d])
+    center_pcd.paint_uniform_color([0, 0, 1])
+
+    coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=min(extents)*0.5, origin=center_3d)
+
+    normal_line = o3d.geometry.LineSet()
+    normal_line.points = o3d.utility.Vector3dVector([center_3d, center_3d + normal * min(extents)*0.5])
+    normal_line.lines = o3d.utility.Vector2iVector([[0, 1]])
+    normal_line.colors = o3d.utility.Vector3dVector([[1, 1, 0]])
+
+    debug_geometries = [original_points_pcd, projected_points_pcd, center_pcd, coordinate_frame, normal_line, plane_mesh]
+
+    if DEBUG:
+        o3d.visualization.draw_geometries(debug_geometries, window_name="Plane Mesh Debug Visualization")
+
+    return plane_mesh
+
+def segment_multiple_planes(pcd, distance_threshold=0.05, ransac_n=4, num_iterations=1000, min_points=200):
+    clusters, _ = cluster_normals(pcd, angle_threshold=10, min_points=min_points)
+
     planes = []
     plane_colors = []
-    remaining_points = pcd
     pcds = []
     plane_models = []
-    
-    while True and len(planes) < max_planes:
-        plane_model, inliers = remaining_points.segment_plane(distance_threshold=distance_threshold,
-                                                              ransac_n=ransac_n,
-                                                              num_iterations=num_iterations)
-        
+    plane_meshes = []
+
+    for cluster in clusters:
+        cluster_pcd = pcd.select_by_index(cluster)
+
+        plane_model, inliers = cluster_pcd.segment_plane(distance_threshold=distance_threshold,
+                                                         ransac_n=ransac_n,
+                                                         num_iterations=num_iterations)
+
         if len(inliers) < min_points:
-            break
-        
-        inlier_cloud = remaining_points.select_by_index(inliers)
+            continue
+
+        inlier_cloud = cluster_pcd.select_by_index(inliers)
         pcds.append(inlier_cloud)
         plane_models.append(plane_model)
         print(f"Found a plane with {len(inliers)} inliers.")
-        outlier_cloud = remaining_points.select_by_index(inliers, invert=True)
-        
+
         plane_color = np.random.rand(3)
         inlier_cloud.paint_uniform_color(plane_color)
-        
+
         planes.append(inlier_cloud)
         plane_colors.append(plane_color)
-        
-        remaining_points = outlier_cloud
-    
+
+        plane_mesh = create_plane_mesh(plane_model, np.asarray(inlier_cloud.points), plane_color)
+        plane_meshes.append(plane_mesh)
+
+    all_plane_indices = set()
+    for cluster in clusters:
+        all_plane_indices.update(cluster)
+    remaining_indices = set(range(len(pcd.points))) - all_plane_indices
+    remaining_points = pcd.select_by_index(list(remaining_indices))
+
+    geometries = [pcd] + plane_meshes
+    if DEBUG:
+        o3d.visualization.draw_geometries(geometries, window_name="Planes and Point Cloud")
+
     return planes, plane_colors, remaining_points, pcds, plane_models
 
 
 if __name__ == "__main__":
-    exp_path = "/local-scratch2/diliash/diorama/third_party/Inpaint-Anything/results/gt-rerun-vis-pcd/merged"
-    pcd_type = "inpainted_pcd_marigold-lcm"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--exp_path", type=str, required=True)
+    parser.add_argument("--pcd_type", type=str, required=True)
+    args = parser.parse_args()
+    exp_path = args.exp_path
+    pcd_type = args.pcd_type
+    compute_planes = False
 
-    failed_scenes = []
-    scene_dirs = glob(f"{exp_path}/*")
+    scene_dirs = glob(f"{exp_path}/scene*")
     for scene_dir in scene_dirs:
         scene_id = scene_dir.split("/")[-1]
-        if scene_id not in ['scene00113']:
-            continue
+        print(f"\nProcessing scene {scene_id}")
         scene_pcd = o3d.io.read_point_cloud(f"{scene_dir}/{pcd_type}.ply")
-        try:
-            segmented_planes, plane_colors, scene_pcd_remain, pcds, plane_models = segment_multiple_planes(scene_pcd)
-        except:
-            print(f"Failed to segment planes for scene {scene_id}.")
-            failed_scenes.append(scene_id)
-            continue
-        vis_geometries = segmented_planes + [scene_pcd_remain]
-        save_visualization(vis_geometries, f"{scene_dir}/{pcd_type}_segmentation.png")
-        os.makedirs(f"{scene_dir}/{pcd_type}_segmentation", exist_ok=True)
-        for i, pcd in enumerate(pcds):
-            o3d.io.write_point_cloud(f"{scene_dir}/{pcd_type}_segmentation/{i}.ply", pcd)
-            np.save(f"{scene_dir}/{pcd_type}_segmentation/{i}.npy", plane_models[i])
-    print(f"Failed to segment {len(failed_scenes)} scenes. Failed scenes: {failed_scenes}")
+        processed_scene_pcd = preprocess_pcd(scene_pcd)
+        point_to_pixel_map = np.load(f"{scene_dir}/{pcd_type}_mapping.npz", allow_pickle=True)["map"].tolist()
+
+        if os.path.exists(f"{scene_dir}/{pcd_type}_m3d_custom_m3d_normals_segmentation"):
+            os.system(f"rm -r {scene_dir}/{pcd_type}_m3d_custom_m3d_normals_segmentation")
+        os.makedirs(f"{scene_dir}/{pcd_type}_m3d_custom_m3d_normals_segmentation", exist_ok=True)
+        clusters, cluster_avg_normals = cluster_normals(processed_scene_pcd, angle_threshold=5, min_points=200)
+        # Determine which one is the floor plane (the most y-up normal)
+        floor_idx = np.argmax([np.abs(n[1]) for n in cluster_avg_normals])
+        # Map segmentation (clusters) to original point cloud using KNN
+        original_points = np.asarray(scene_pcd.points)
+        processed_points = np.asarray(processed_scene_pcd.points)
+
+        tree = cKDTree(processed_points)
+        _, indices = tree.query(original_points)
+
+        mapping = np.zeros(len(original_points), dtype=int)
+        for i, cluster in enumerate(clusters):
+            for idx in cluster:
+                mapping[indices == idx] = i + 1  # Add 1 to avoid 0 as a label
+
+        vis_pcd = o3d.geometry.PointCloud()
+        vis_pcd.points = o3d.utility.Vector3dVector(original_points)
+        vis_colors = np.array([np.random.rand(3) for _ in range(max(mapping) + 1)])
+        vis_pcd.colors = o3d.utility.Vector3dVector(vis_colors[mapping])
+
+        if DEBUG:
+            o3d.visualization.draw_geometries([vis_pcd])
+        if os.path.exists(f"{scene_dir}/{pcd_type}_m3d_custom_m3d_normals_segmentation/clusters"):
+            os.system(f"rm -r {scene_dir}/{pcd_type}_m3d_custom_m3d_normals_segmentation/clusters")
+        os.makedirs(f"{scene_dir}/{pcd_type}_m3d_custom_m3d_normals_segmentation/clusters", exist_ok=True)
+        # Save clusters on full point clouds, remember to use mapping since clusters are on processed point cloud
+        sem_ref = {}
+        for i, cluster in enumerate(clusters):
+            if i == floor_idx:
+                pcd_name = f"wall_{i+1}"
+                sem_ref[str(i + 1)] = "floor"
+            else:
+                pcd_name = f"wall_{i+1}"
+                sem_ref[str(i + 1)] = "wall"
+            cluster_pcd = scene_pcd.select_by_index(np.where(mapping == i + 1)[0])
+            o3d.io.write_point_cloud(f"{scene_dir}/{pcd_type}_m3d_custom_m3d_normals_segmentation/clusters/{pcd_name}.ply", cluster_pcd)
+            np.save(f"{scene_dir}/{pcd_type}_m3d_custom_m3d_normals_segmentation/clusters/{pcd_name}_normal.npy", cluster_avg_normals[i])
+        os.makedirs(f"{scene_dir}/{pcd_type}_m3d_custom_m3d_normals_segmentation/arch", exist_ok=True)
+        json.dump(sem_ref, open(f"{scene_dir}/{pcd_type}_m3d_custom_m3d_normals_segmentation/arch/semantic_reference.json", "w"))
+        segmentation_image = np.zeros((1008, 784), dtype=int)
+        for i, coord in point_to_pixel_map.items():
+            segmentation_image[coord] = mapping[i]
+
+        segmentation_image = segmentation_image.T
+        cv2.imwrite(f"{scene_dir}/{pcd_type}_m3d_custom_m3d_normals_segmentation/segmentation_image.png", segmentation_image)
+        segmentation_image_vis = cv2.applyColorMap((segmentation_image / segmentation_image.max() * 255).astype(np.uint8), cv2.COLORMAP_JET)
+        cv2.imwrite(f"{scene_dir}/{pcd_type}_m3d_custom_m3d_normals_segmentation/segmentation_image_vis.png", segmentation_image_vis)
+        np.save(f"{scene_dir}/{pcd_type}_m3d_custom_m3d_normals_segmentation/segmentation_image.npy", segmentation_image)
