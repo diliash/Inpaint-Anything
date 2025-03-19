@@ -1,4 +1,5 @@
 import argparse
+import copy
 import json
 import os
 from glob import glob
@@ -10,11 +11,6 @@ from scipy.spatial import cKDTree
 from sklearn.cluster import DBSCAN, KMeans
 
 DEBUG = False
-INTRINSICS = {
-    "nyu": (518.8579, 519.4696, 325.58246, 253.73616, 480, 640),  # (fx, fy, cx, cy, height, width)
-    "multiview": (224/(2*np.tan((np.pi/3)/2)), 224/(2*np.tan((np.pi/3)/2)), 112, 112, 224, 224),
-    "wss": (784/(2*np.tan((np.pi/3)/2)), 784/(2*np.tan((np.pi/3)/2)), 504, 392, 784, 1008)
-}
 
 
 def preprocess_pcd(scene_pcd):
@@ -49,7 +45,7 @@ def save_visualization(geometries, filename, width=512, height=512):
     vis.destroy_window()
 
 
-def cluster_normals(pcd, angle_threshold=10, min_points=200, eps=0.1, min_samples=5, n_seeds=10):
+def cluster_normals(pcd, angle_threshold=10, min_points=400, eps=0.1, min_samples=5, n_seeds=12):
     normals = np.asarray(pcd.normals)
     points = np.asarray(pcd.points)
     clusters = []
@@ -99,6 +95,27 @@ def cluster_normals(pcd, angle_threshold=10, min_points=200, eps=0.1, min_sample
 
             for subcluster in subclusters:
                 if len(subcluster) >= min_points:
+                    # Check if the bbox is close to mean
+                    subcluster_points = points[subcluster]
+                    bbox = np.array([np.min(subcluster_points, axis=0), np.max(subcluster_points, axis=0)])
+                    bbox_center = np.mean(bbox, axis=0)
+
+                    sub_pcd = vis_pcd.select_by_index(subcluster)
+                    sub_pcd.paint_uniform_color([1, 0, 0])
+
+                    bbox_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.05)
+                    bbox_sphere.translate(bbox_center)
+                    bbox_sphere.paint_uniform_color([0, 1, 0])
+
+                    mean_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.05)
+                    mean_sphere.translate(np.mean(subcluster_points, axis=0))
+
+                    if DEBUG:
+                        print(f"abs(bbox - mean) {np.abs(np.linalg.norm(bbox_center - np.mean(subcluster_points, axis=0)))}")
+                        o3d.visualization.draw_geometries([sub_pcd, bbox_sphere, mean_sphere],
+                                                           window_name="Subcluster BBox and Mean Visualization",
+                                                           width=800, height=600)
+
                     clusters.append(subcluster)
                     remaining_indices -= set(subcluster)
 
@@ -110,7 +127,7 @@ def cluster_normals(pcd, angle_threshold=10, min_points=200, eps=0.1, min_sample
                     subcluster_pcd = vis_pcd.select_by_index(subcluster)
                     subcluster_pcd.paint_uniform_color(subcluster_color)
 
-                    clusters_avg_normals.append(np.mean(normals[subcluster], axis=0))
+                    clusters_avg_normals.append(np.mean(normals[subcluster], axis=0) / np.linalg.norm(np.mean(normals[subcluster], axis=0)))
 
                     other_pcd = vis_pcd.select_by_index(list(remaining_indices))
                     other_pcd.paint_uniform_color([0.8, 0.8, 0.8])  # Light gray
@@ -135,13 +152,24 @@ def cluster_normals(pcd, angle_threshold=10, min_points=200, eps=0.1, min_sample
 
     if noise_indices and clusters:
         print(f"Assigning {len(noise_indices)} noise points to closest clusters")
-        cluster_centers = [np.mean(points[c], axis=0) for c in clusters]
-        tree = cKDTree(cluster_centers)
+        tree = cKDTree([cluser_point for cluster in clusters for cluser_point in points[cluster]])
+        tree_points_all_points_map = {}
+        current_point_idx = 0
+        for cluster in clusters:
+            for point_idx in cluster:
+                tree_points_all_points_map[current_point_idx] = point_idx
+                current_point_idx += 1
 
+        new_clusters = copy.deepcopy(clusters)
         for idx in noise_indices:
-            _, closest_cluster_idx = tree.query(points[idx])
-            clusters[closest_cluster_idx].append(idx)
-
+            _, point_idx = tree.query(points[idx])
+            closest_cluster_idx = -1
+            for i, cluster in enumerate(clusters):
+                if tree_points_all_points_map[point_idx] in cluster:
+                    closest_cluster_idx = i
+                    break
+            new_clusters[closest_cluster_idx].append(idx)
+        clusters = new_clusters
         vis_colors = np.asarray(vis_pcd.colors)
         for i, cluster in enumerate(clusters):
             cluster_color = np.random.rand(3)
@@ -224,7 +252,7 @@ def create_plane_mesh(plane_model, points, color):
     return plane_mesh
 
 def segment_multiple_planes(pcd, distance_threshold=0.05, ransac_n=4, num_iterations=1000, min_points=200):
-    clusters, _ = cluster_normals(pcd, angle_threshold=10, min_points=min_points)
+    clusters, _ = cluster_normals(pcd, angle_threshold=3, min_points=min_points)
 
     planes = []
     plane_colors = []
@@ -273,10 +301,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--exp_path", type=str, required=True)
     parser.add_argument("--pcd_type", type=str, required=True)
+    parser.add_argument("--postfix", type=str, required=True)
     args = parser.parse_args()
     exp_path = args.exp_path
     pcd_type = args.pcd_type
+    postfix = args.postfix
     compute_planes = False
+
+    import time
+    start = time.time()
 
     scene_dirs = glob(f"{exp_path}/scene*")
     for scene_dir in scene_dirs:
@@ -286,12 +319,40 @@ if __name__ == "__main__":
         processed_scene_pcd = preprocess_pcd(scene_pcd)
         point_to_pixel_map = np.load(f"{scene_dir}/{pcd_type}_mapping.npz", allow_pickle=True)["map"].tolist()
 
-        if os.path.exists(f"{scene_dir}/{pcd_type}_m3d_custom_m3d_normals_segmentation"):
-            os.system(f"rm -r {scene_dir}/{pcd_type}_m3d_custom_m3d_normals_segmentation")
-        os.makedirs(f"{scene_dir}/{pcd_type}_m3d_custom_m3d_normals_segmentation", exist_ok=True)
-        clusters, cluster_avg_normals = cluster_normals(processed_scene_pcd, angle_threshold=5, min_points=200)
-        # Determine which one is the floor plane (the most y-up normal)
-        floor_idx = np.argmax([np.abs(n[1]) for n in cluster_avg_normals])
+        if os.path.exists(f"{scene_dir}/{pcd_type}_{postfix}"):
+            os.system(f"rm -r {scene_dir}/{pcd_type}_{postfix}")
+        os.makedirs(f"{scene_dir}/{pcd_type}_{postfix}", exist_ok=True)
+        clusters, cluster_avg_normals = cluster_normals(processed_scene_pcd, angle_threshold=10, min_points=200)
+        # Determine which one is the floor plane (the most y-up normal and largest cluster)
+        candidates = [(n[1], len(clusters[i])) for i, n in enumerate(cluster_avg_normals)]
+        floor_idx = None
+        current_candidate = None
+        for i, candidate in enumerate(candidates):
+            if candidate[0] > 0.7 and (current_candidate is None or current_candidate[1] < candidate[1]):
+                # print(f"New floor candidate: {candidate} ({i}), better than {current_candidate} {floor_idx}")
+                floor_idx = i
+                current_candidate = candidate
+        ceiling_ids = []
+        ceiling_candidate_idx = np.argmin([n[1] for n in cluster_avg_normals])
+        if cluster_avg_normals[ceiling_candidate_idx][1] < -0.7:
+            ceiling_ids.append(ceiling_candidate_idx)
+        else:
+            ceiling_ids = None
+        # Remove ceiling plane
+        new_clusters = []
+        new_cluster_avg_normals = []
+        new_floor_idx = None
+        if ceiling_ids is not None:
+            for i, cluster in enumerate(clusters):
+                if i not in ceiling_ids:
+                    new_clusters.append(cluster)
+                    new_cluster_avg_normals.append(cluster_avg_normals[i])
+                if i == floor_idx:
+                    new_floor_idx = len(new_clusters) - 1
+            clusters = new_clusters
+            cluster_avg_normals = new_cluster_avg_normals
+            floor_idx = new_floor_idx
+
         # Map segmentation (clusters) to original point cloud using KNN
         original_points = np.asarray(scene_pcd.points)
         processed_points = np.asarray(processed_scene_pcd.points)
@@ -311,9 +372,9 @@ if __name__ == "__main__":
 
         if DEBUG:
             o3d.visualization.draw_geometries([vis_pcd])
-        if os.path.exists(f"{scene_dir}/{pcd_type}_m3d_custom_m3d_normals_segmentation/clusters"):
-            os.system(f"rm -r {scene_dir}/{pcd_type}_m3d_custom_m3d_normals_segmentation/clusters")
-        os.makedirs(f"{scene_dir}/{pcd_type}_m3d_custom_m3d_normals_segmentation/clusters", exist_ok=True)
+        if os.path.exists(f"{scene_dir}/{pcd_type}_{postfix}/clusters"):
+            os.system(f"rm -r {scene_dir}/{pcd_type}_{postfix}/clusters")
+        os.makedirs(f"{scene_dir}/{pcd_type}_{postfix}/clusters", exist_ok=True)
         # Save clusters on full point clouds, remember to use mapping since clusters are on processed point cloud
         sem_ref = {}
         for i, cluster in enumerate(clusters):
@@ -324,16 +385,17 @@ if __name__ == "__main__":
                 pcd_name = f"wall_{i+1}"
                 sem_ref[str(i + 1)] = "wall"
             cluster_pcd = scene_pcd.select_by_index(np.where(mapping == i + 1)[0])
-            o3d.io.write_point_cloud(f"{scene_dir}/{pcd_type}_m3d_custom_m3d_normals_segmentation/clusters/{pcd_name}.ply", cluster_pcd)
-            np.save(f"{scene_dir}/{pcd_type}_m3d_custom_m3d_normals_segmentation/clusters/{pcd_name}_normal.npy", cluster_avg_normals[i])
-        os.makedirs(f"{scene_dir}/{pcd_type}_m3d_custom_m3d_normals_segmentation/arch", exist_ok=True)
-        json.dump(sem_ref, open(f"{scene_dir}/{pcd_type}_m3d_custom_m3d_normals_segmentation/arch/semantic_reference.json", "w"))
+            o3d.io.write_point_cloud(f"{scene_dir}/{pcd_type}_{postfix}/clusters/{pcd_name}.ply", cluster_pcd)
+            np.save(f"{scene_dir}/{pcd_type}_{postfix}/clusters/{pcd_name}_normal.npy", cluster_avg_normals[i])
+        os.makedirs(f"{scene_dir}/{pcd_type}_{postfix}/arch", exist_ok=True)
+        json.dump(sem_ref, open(f"{scene_dir}/{pcd_type}_{postfix}/arch/semantic_reference.json", "w"))
         segmentation_image = np.zeros((1008, 784), dtype=int)
         for i, coord in point_to_pixel_map.items():
             segmentation_image[coord] = mapping[i]
-
         segmentation_image = segmentation_image.T
-        cv2.imwrite(f"{scene_dir}/{pcd_type}_m3d_custom_m3d_normals_segmentation/segmentation_image.png", segmentation_image)
+        cv2.imwrite(f"{scene_dir}/{pcd_type}_{postfix}/segmentation_image.png", segmentation_image)
         segmentation_image_vis = cv2.applyColorMap((segmentation_image / segmentation_image.max() * 255).astype(np.uint8), cv2.COLORMAP_JET)
-        cv2.imwrite(f"{scene_dir}/{pcd_type}_m3d_custom_m3d_normals_segmentation/segmentation_image_vis.png", segmentation_image_vis)
-        np.save(f"{scene_dir}/{pcd_type}_m3d_custom_m3d_normals_segmentation/segmentation_image.npy", segmentation_image)
+        cv2.imwrite(f"{scene_dir}/{pcd_type}_{postfix}/segmentation_image_vis.png", segmentation_image_vis)
+        np.save(f"{scene_dir}/{pcd_type}_{postfix}/segmentation_image.npy", segmentation_image)
+        print(f"Saved segmentation to {scene_dir}/{pcd_type}_{postfix}")
+    print(f"Time taken: {time.time() - start}")
